@@ -1,18 +1,42 @@
-import { PredictionData, TopPrediction, ConfidenceScore, TeamStats, HeadToHeadStats, MarketType, ConfidenceLevel } from '../types/prediction';
+import { 
+  PredictionData, 
+  TopPrediction, 
+  DetailedConfidenceScore, 
+  TeamStats, 
+  HeadToHeadStats, 
+  MarketType, 
+  ConfidenceLevel,
+  RISK_PENALTIES,
+  CONFIDENCE_THRESHOLDS
+} from '../types/prediction';
 
+/**
+ * Confidence calculation weights for winner predictions
+ * Should sum to 1.0
+ */
 const WEIGHTS = {
-  formScore: 0.30,
-  homeAwayStrength: 0.25,
-  headToHead: 0.20,
-  goalDifference: 0.15,
-  leaguePosition: 0.10,
+  formScore: 0.30,           // Recent form is most important
+  homeAwayStrength: 0.25,    // Home/Away advantage matters
+  headToHead: 0.20,          // Historical matchups
+  goalDifference: 0.15,      // Offensive/Defensive capability
+  leaguePosition: 0.10,      // Overall standings
 };
 
-const MIN_CONFIDENCE_THRESHOLD = 80;
+// Minimum confidence before applying risk penalty
+const BASE_MIN_CONFIDENCE_THRESHOLD = 60;
+
+// After risk penalty applied
+const FINAL_MIN_CONFIDENCE_THRESHOLD = 80;
+
+// Helper function to safely access nested values
+const safeGet = (value: any, defaultValue: number = 0): number => {
+  return Number.isFinite(value) ? value : defaultValue;
+};
 
 export class PredictionEngine {
   /**
    * Generate top 3 safest predictions for a match
+   * Comprehensive prediction system with risk assessment
    */
   async generatePredictions(
     matchId: string,
@@ -24,56 +48,99 @@ export class PredictionEngine {
     // Generate all possible market predictions
     const allPredictions: TopPrediction[] = [];
 
-    // Winner markets
-    allPredictions.push(
-      this.predictWinner('home_win', homeTeam, awayTeam, headToHead, leagueTable),
-      this.predictWinner('away_win', homeTeam, awayTeam, headToHead, leagueTable),
-      this.predictWinner('draw', homeTeam, awayTeam, headToHead, leagueTable)
-    );
+    try {
+      // Validate input data
+      this.validateTeamStats(homeTeam, awayTeam);
+      this.validateHeadToHeadStats(headToHead);
 
-    // Double chance markets
-    allPredictions.push(
-      this.predictDoubleChance('double_chance_1x', homeTeam, awayTeam),
-      this.predictDoubleChance('double_chance_x2', homeTeam, awayTeam),
-      this.predictDoubleChance('double_chance_12', homeTeam, awayTeam)
-    );
+      // Winner markets
+      allPredictions.push(
+        this.predictWinner('home_win', homeTeam, awayTeam, headToHead, leagueTable),
+        this.predictWinner('away_win', homeTeam, awayTeam, headToHead, leagueTable),
+        this.predictWinner('draw', homeTeam, awayTeam, headToHead, leagueTable)
+      );
 
-    // Over/Under goals
-    allPredictions.push(
-      this.predictGoals('over_15', homeTeam, awayTeam, headToHead),
-      this.predictGoals('over_25', homeTeam, awayTeam, headToHead),
-      this.predictGoals('over_35', homeTeam, awayTeam, headToHead)
-    );
+      // Double chance markets
+      allPredictions.push(
+        this.predictDoubleChance('double_chance_1x', homeTeam, awayTeam),
+        this.predictDoubleChance('double_chance_x2', homeTeam, awayTeam),
+        this.predictDoubleChance('double_chance_12', homeTeam, awayTeam)
+      );
 
-    // BTTS
-    allPredictions.push(this.predictBTTS(homeTeam, awayTeam, headToHead));
+      // Over/Under goals
+      allPredictions.push(
+        this.predictGoals('over_15', homeTeam, awayTeam, headToHead),
+        this.predictGoals('over_25', homeTeam, awayTeam, headToHead),
+        this.predictGoals('over_35', homeTeam, awayTeam, headToHead)
+      );
 
-    // Corners
-    allPredictions.push(
-      this.predictCorners('corners_over_8', homeTeam, awayTeam),
-      this.predictCorners('corners_over_10', homeTeam, awayTeam),
-      this.predictCorners('corners_over_12', homeTeam, awayTeam)
-    );
+      // BTTS
+      allPredictions.push(this.predictBTTS(homeTeam, awayTeam, headToHead));
 
-    // Cards
-    allPredictions.push(
-      this.predictCards('cards_over_3', homeTeam, awayTeam),
-      this.predictCards('cards_over_4', homeTeam, awayTeam),
-      this.predictCards('cards_over_5', homeTeam, awayTeam)
-    );
+      // Corners
+      allPredictions.push(
+        this.predictCorners('corners_over_8', homeTeam, awayTeam),
+        this.predictCorners('corners_over_10', homeTeam, awayTeam),
+        this.predictCorners('corners_over_12', homeTeam, awayTeam)
+      );
 
-    // Filter by minimum confidence threshold
-    const validPredictions = allPredictions.filter(
-      (p) => p.confidence >= MIN_CONFIDENCE_THRESHOLD
-    );
+      // Cards
+      allPredictions.push(
+        this.predictCards('cards_over_3', homeTeam, awayTeam),
+        this.predictCards('cards_over_4', homeTeam, awayTeam),
+        this.predictCards('cards_over_5', homeTeam, awayTeam)
+      );
 
-    // Sort by confidence descending
-    validPredictions.sort((a, b) => b.confidence - a.confidence);
+      // Filter by minimum base confidence threshold
+      const validPredictions = allPredictions.filter(
+        (p) => p.rawConfidence >= BASE_MIN_CONFIDENCE_THRESHOLD
+      );
 
-    // Return top 3
-    return validPredictions.slice(0, 3);
+      // Filter by final confidence threshold (after risk penalty)
+      const safePredictions = validPredictions.filter(
+        (p) => p.finalConfidence >= FINAL_MIN_CONFIDENCE_THRESHOLD
+      );
+
+      // Sort by final confidence descending
+      safePredictions.sort((a, b) => b.finalConfidence - a.finalConfidence);
+
+      // Return top 3, assign ranks
+      const topThree = safePredictions.slice(0, 3).map((pred, index) => ({
+        ...pred,
+        rank: (index + 1) as 1 | 2 | 3,
+      }));
+
+      return topThree;
+    } catch (error) {
+      console.error('Error generating predictions:', error);
+      return [];
+    }
   }
 
+  /**
+   * Validate team statistics for completeness
+   */
+  private validateTeamStats(homeTeam: TeamStats, awayTeam: TeamStats): void {
+    if (!homeTeam.teamId || !awayTeam.teamId) {
+      throw new Error('Invalid team IDs');
+    }
+    if (homeTeam.lastFiveMatches.wins === undefined || awayTeam.lastFiveMatches.wins === undefined) {
+      throw new Error('Missing match history');
+    }
+  }
+
+  /**
+   * Validate head-to-head statistics
+   */
+  private validateHeadToHeadStats(h2h: HeadToHeadStats): void {
+    if (h2h.totalMatches === 0) {
+      throw new Error('No head-to-head history available');
+    }
+  }
+
+  /**
+   * Predict winner markets (home, away, draw)
+   */
   private predictWinner(
     market: 'home_win' | 'away_win' | 'draw',
     homeTeam: TeamStats,
@@ -90,29 +157,42 @@ export class PredictionEngine {
       awayTeam,
       leagueTable
     );
+    const goalDifferenceScore = this.calculateGoalDifferenceScore(market, homeTeam, awayTeam);
 
-    const confidence = this.calculateFinalConfidence({
+    const rawConfidence = this.calculateFinalConfidence({
       formScore,
       homeAwayScore,
       headToHeadScore: h2hScore,
-      goalDifferenceScore: 0,
+      goalDifferenceScore,
       leaguePositionScore,
       goalTrendScore: 0,
       cornerTrendScore: 0,
       cardTrendScore: 0,
-      final: 0,
+      bttsConsistencyScore: 0,
+      riskPenalty: 0,
+      rawConfidence: 0,
+      finalConfidence: 0,
     });
 
+    const riskPenalty = RISK_PENALTIES[market] || 0;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence + riskPenalty));
+
     return {
-      rank: 0,
+      rank: 1,
       prediction: this.getWinnerPredictionText(market, homeTeam.teamName, awayTeam.teamName),
       market,
-      confidence,
-      classification: this.classifyConfidence(confidence),
-      reasoning: this.getWinnerReasoning(market, homeTeam, awayTeam, confidence),
+      rawConfidence: Math.min(rawConfidence, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: this.getWinnerReasoning(market, homeTeam, awayTeam, finalConfidence),
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
+  /**
+   * Predict over/under goals
+   */
   private predictGoals(
     market: string,
     homeTeam: TeamStats,
@@ -121,125 +201,166 @@ export class PredictionEngine {
   ): TopPrediction {
     const goalAverage = (homeTeam.goalStats.averageScored + awayTeam.goalStats.averageScored) / 2;
     const overRateHistory = this.getOverRateHistory(market, homeTeam, awayTeam);
-    const h2hGoals = headToHead.averageGoals;
+    const h2hGoals = safeGet(headToHead.averageGoals, 2.5);
     const recentForm = (homeTeam.lastFiveMatches.wins + awayTeam.lastFiveMatches.wins) / 10;
 
-    const confidence =
-      goalAverage * 0.4 + overRateHistory * 0.3 + h2hGoals * 0.2 + recentForm * 0.1;
+    const rawConfidence =
+      safeGet(goalAverage) * 0.4 + safeGet(overRateHistory) * 0.3 + safeGet(h2hGoals / 5) * 0.2 + safeGet(recentForm) * 0.1;
+
+    const riskPenalty = RISK_PENALTIES[market as MarketType] || -5;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence * 100 + riskPenalty));
 
     return {
-      rank: 0,
-      prediction: `${market.replace(/_/g, ' ').toUpperCase()} Goals`,
+      rank: 1,
+      prediction: `${market.replace(/_/g, ' ').toUpperCase()}`,
       market: market as MarketType,
-      confidence: Math.min(confidence * 100, 100),
-      classification: this.classifyConfidence(Math.min(confidence * 100, 100)),
-      reasoning: `Goal average: ${goalAverage.toFixed(2)}, H2H: ${h2hGoals.toFixed(2)}`,
+      rawConfidence: Math.min(rawConfidence * 100, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: `Goal average: ${goalAverage.toFixed(2)}, H2H: ${h2hGoals.toFixed(2)}, Rate: ${(overRateHistory * 100).toFixed(1)}%`,
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
+  /**
+   * Predict both teams to score
+   */
   private predictBTTS(
     homeTeam: TeamStats,
     awayTeam: TeamStats,
     headToHead: HeadToHeadStats
   ): TopPrediction {
-    const bttsRate = headToHead.bttsPercentage / 100;
-    const homeGoalsConceded = homeTeam.goalStats.averageConceded / 3;
-    const awayGoalsConceded = awayTeam.goalStats.averageConceded / 3;
-    const recentForm =
-      (homeTeam.lastFiveMatches.wins + awayTeam.lastFiveMatches.wins) / 10;
+    const bttsRate = safeGet(headToHead.bttsPercentage) / 100;
+    const homeGoalsConceded = safeGet(homeTeam.goalStats.averageConceded) / 3;
+    const awayGoalsConceded = safeGet(awayTeam.goalStats.averageConceded) / 3;
+    const recentForm = (homeTeam.lastFiveMatches.wins + awayTeam.lastFiveMatches.wins) / 10;
 
-    const confidence = bttsRate * 0.4 + homeGoalsConceded * 0.3 + awayGoalsConceded * 0.2 + recentForm * 0.1;
+    const rawConfidence = bttsRate * 0.4 + safeGet(homeGoalsConceded) * 0.3 + safeGet(awayGoalsConceded) * 0.2 + safeGet(recentForm) * 0.1;
+
+    const riskPenalty = RISK_PENALTIES['btts_yes'] || -5;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence * 100 + riskPenalty));
 
     return {
-      rank: 0,
+      rank: 1,
       prediction: 'Both Teams To Score',
       market: 'btts_yes',
-      confidence: Math.min(confidence * 100, 100),
-      classification: this.classifyConfidence(Math.min(confidence * 100, 100)),
-      reasoning: `BTTS Rate: ${(bttsRate * 100).toFixed(1)}%, H2H BTTS: ${headToHead.bttsPercentage.toFixed(1)}%`,
+      rawConfidence: Math.min(rawConfidence * 100, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: `BTTS Rate: ${(bttsRate * 100).toFixed(1)}%, H2H: ${safeGet(headToHead.bttsPercentage).toFixed(1)}%`,
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
+  /**
+   * Predict corners markets
+   */
   private predictCorners(
     market: string,
     homeTeam: TeamStats,
     awayTeam: TeamStats
   ): TopPrediction {
     const threshold = parseInt(market.split('_').pop() || '8');
-    const teamAverage = (homeTeam.cornerStats.averageWon + awayTeam.cornerStats.averageWon) / 2;
-    const opponentAverage = (homeTeam.cornerStats.averageConceded + awayTeam.cornerStats.averageConceded) / 2;
+    const teamAverage = (safeGet(homeTeam.cornerStats.averageWon) + safeGet(awayTeam.cornerStats.averageWon)) / 2;
+    const opponentAverage = (safeGet(homeTeam.cornerStats.averageConceded) + safeGet(awayTeam.cornerStats.averageConceded)) / 2;
     const leagueAverage = (teamAverage + opponentAverage) / 2;
 
-    const confidence =
-      (teamAverage / threshold) * 0.5 +
-      (opponentAverage / threshold) * 0.3 +
-      (leagueAverage / threshold) * 0.2;
+    const rawConfidence =
+      (safeGet(teamAverage) / threshold) * 0.5 +
+      (safeGet(opponentAverage) / threshold) * 0.3 +
+      (safeGet(leagueAverage) / threshold) * 0.2;
+
+    const riskPenalty = RISK_PENALTIES[market as MarketType] || -10;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence * 100 + riskPenalty));
 
     return {
-      rank: 0,
+      rank: 1,
       prediction: `Over ${threshold} Corners`,
       market: market as MarketType,
-      confidence: Math.min(confidence * 100, 100),
-      classification: this.classifyConfidence(Math.min(confidence * 100, 100)),
-      reasoning: `Avg corners: ${teamAverage.toFixed(1)}, Threshold: ${threshold}`,
+      rawConfidence: Math.min(rawConfidence * 100, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: `Avg corners: ${teamAverage.toFixed(1)}, Threshold: ${threshold}, League avg: ${leagueAverage.toFixed(1)}`,
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
+  /**
+   * Predict cards markets
+   */
   private predictCards(
     market: string,
     homeTeam: TeamStats,
     awayTeam: TeamStats
   ): TopPrediction {
     const threshold = parseInt(market.split('_').pop() || '3');
-    const teamAverage = (homeTeam.cardStats.averageYellow + awayTeam.cardStats.averageYellow) / 2;
-    const opponentAverage = (homeTeam.cardStats.averageRed + awayTeam.cardStats.averageRed) / 2;
+    const teamAverage = (safeGet(homeTeam.cardStats.averageYellow) + safeGet(awayTeam.cardStats.averageYellow)) / 2;
+    const opponentAverage = (safeGet(homeTeam.cardStats.averageRed) + safeGet(awayTeam.cardStats.averageRed)) / 2;
 
-    const confidence = (teamAverage / threshold) * 0.6 + (opponentAverage / threshold) * 0.4;
+    const rawConfidence = (safeGet(teamAverage) / threshold) * 0.6 + (safeGet(opponentAverage) / threshold) * 0.4;
+
+    const riskPenalty = RISK_PENALTIES[market as MarketType] || -8;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence * 100 + riskPenalty));
 
     return {
-      rank: 0,
+      rank: 1,
       prediction: `Over ${threshold} Cards`,
       market: market as MarketType,
-      confidence: Math.min(confidence * 100, 100),
-      classification: this.classifyConfidence(Math.min(confidence * 100, 100)),
-      reasoning: `Avg cards: ${(teamAverage + opponentAverage).toFixed(1)}, Threshold: ${threshold}`,
+      rawConfidence: Math.min(rawConfidence * 100, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: `Avg yellow: ${teamAverage.toFixed(1)}, Red: ${opponentAverage.toFixed(1)}, Threshold: ${threshold}`,
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
+  /**
+   * Predict double chance markets
+   */
   private predictDoubleChance(
     market: string,
     homeTeam: TeamStats,
     awayTeam: TeamStats
   ): TopPrediction {
-    const homeWinRate = homeTeam.lastTenMatches.wins / 10;
-    const drawRate = (homeTeam.lastTenMatches.draws + awayTeam.lastTenMatches.draws) / 20;
-    const awayWinRate = awayTeam.lastTenMatches.wins / 10;
+    const homeWinRate = safeGet(homeTeam.lastTenMatches.wins) / 10;
+    const drawRate = (safeGet(homeTeam.lastTenMatches.draws) + safeGet(awayTeam.lastTenMatches.draws)) / 20;
+    const awayWinRate = safeGet(awayTeam.lastTenMatches.wins) / 10;
 
-    let confidence = 0;
+    let rawConfidence = 0;
     let text = '';
 
     if (market === 'double_chance_1x') {
-      confidence = (homeWinRate + drawRate) * 100;
+      rawConfidence = homeWinRate + drawRate;
       text = 'Home or Draw';
     } else if (market === 'double_chance_x2') {
-      confidence = (drawRate + awayWinRate) * 100;
+      rawConfidence = drawRate + awayWinRate;
       text = 'Draw or Away';
     } else {
-      confidence = (homeWinRate + awayWinRate) * 100;
+      rawConfidence = homeWinRate + awayWinRate;
       text = 'Home or Away';
     }
 
+    const riskPenalty = RISK_PENALTIES[market as MarketType] || -5;
+    const finalConfidence = Math.max(0, Math.min(100, rawConfidence * 100 + riskPenalty));
+
     return {
-      rank: 0,
+      rank: 1,
       prediction: text,
       market: market as MarketType,
-      confidence: Math.min(confidence, 100),
-      classification: this.classifyConfidence(Math.min(confidence, 100)),
-      reasoning: `Based on recent form analysis`,
+      rawConfidence: Math.min(rawConfidence * 100, 100),
+      riskPenalty,
+      finalConfidence,
+      classification: this.classifyConfidence(finalConfidence),
+      reasoning: `Based on recent form: Home ${(homeWinRate * 100).toFixed(0)}%, Draw ${(drawRate * 100).toFixed(0)}%, Away ${(awayWinRate * 100).toFixed(0)}%`,
+      riskBadge: this.classifyConfidence(finalConfidence),
     };
   }
 
-  // Helper methods
+  // ==================== HELPER METHODS ====================
 
   private calculateFormScore(
     market: string,
@@ -247,11 +368,11 @@ export class PredictionEngine {
     awayTeam: TeamStats
   ): number {
     if (market === 'home_win') {
-      return (homeTeam.lastFiveMatches.wins / 5) * 100;
+      return (safeGet(homeTeam.lastFiveMatches.wins) / 5) * 100;
     } else if (market === 'away_win') {
-      return (awayTeam.lastFiveMatches.wins / 5) * 100;
+      return (safeGet(awayTeam.lastFiveMatches.wins) / 5) * 100;
     } else {
-      return ((homeTeam.lastFiveMatches.draws + awayTeam.lastFiveMatches.draws) / 10) * 100;
+      return ((safeGet(homeTeam.lastFiveMatches.draws) + safeGet(awayTeam.lastFiveMatches.draws)) / 10) * 100;
     }
   }
 
@@ -261,9 +382,11 @@ export class PredictionEngine {
     awayTeam: TeamStats
   ): number {
     if (market === 'home_win') {
-      return (homeTeam.homeStats.wins / 10) * 100;
+      const homeWins = safeGet(homeTeam.homeStats.wins);
+      return (homeWins / 10) * 100;
     } else if (market === 'away_win') {
-      return (awayTeam.awayStats.wins / 10) * 100;
+      const awayWins = safeGet(awayTeam.awayStats.wins);
+      return (awayWins / 10) * 100;
     }
     return 50;
   }
@@ -272,12 +395,16 @@ export class PredictionEngine {
     market: string,
     headToHead: HeadToHeadStats
   ): number {
+    const totalMatches = safeGet(headToHead.team1Wins) + safeGet(headToHead.team2Wins) + safeGet(headToHead.draws);
+
+    if (totalMatches === 0) return 50;
+
     if (market === 'home_win') {
-      return (headToHead.team1Wins / (headToHead.team1Wins + headToHead.team2Wins + headToHead.draws)) * 100;
+      return (safeGet(headToHead.team1Wins) / totalMatches) * 100;
     } else if (market === 'away_win') {
-      return (headToHead.team2Wins / (headToHead.team1Wins + headToHead.team2Wins + headToHead.draws)) * 100;
+      return (safeGet(headToHead.team2Wins) / totalMatches) * 100;
     } else {
-      return (headToHead.draws / (headToHead.team1Wins + headToHead.team2Wins + headToHead.draws)) * 100;
+      return (safeGet(headToHead.draws) / totalMatches) * 100;
     }
   }
 
@@ -288,9 +415,25 @@ export class PredictionEngine {
     leagueTable: any
   ): number {
     if (market === 'home_win') {
-      return 50 + (leagueTable.homePosition || 8) * 5;
+      return 50 + (safeGet(leagueTable.homePosition, 8)) * 5;
     } else if (market === 'away_win') {
-      return 50 - (leagueTable.awayPosition || 8) * 5;
+      return 50 - (safeGet(leagueTable.awayPosition, 8)) * 5;
+    }
+    return 50;
+  }
+
+  private calculateGoalDifferenceScore(
+    market: string,
+    homeTeam: TeamStats,
+    awayTeam: TeamStats
+  ): number {
+    const homeGD = safeGet(homeTeam.goalStats.goalDifference);
+    const awayGD = safeGet(awayTeam.goalStats.goalDifference);
+
+    if (market === 'home_win') {
+      return 50 + (homeGD - awayGD) * 5;
+    } else if (market === 'away_win') {
+      return 50 + (awayGD - homeGD) * 5;
     }
     return 50;
   }
@@ -300,13 +443,22 @@ export class PredictionEngine {
     homeTeam: TeamStats,
     awayTeam: TeamStats
   ): number {
-    const threshold = parseInt(market.split('_')[1]);
-    if (threshold === 1) return (homeTeam.goalStats.over15Rate + awayTeam.goalStats.over15Rate) / 2 / 100;
-    if (threshold === 2) return (homeTeam.goalStats.over25Rate + awayTeam.goalStats.over25Rate) / 2 / 100;
-    return (homeTeam.goalStats.over35Rate + awayTeam.goalStats.over35Rate) / 2 / 100;
+    const parts = market.split('_');
+    const threshold = parseInt(parts[1]);
+
+    let rate = 0;
+    if (threshold === 1) {
+      rate = (safeGet(homeTeam.goalStats.over15Rate) + safeGet(awayTeam.goalStats.over15Rate)) / 2 / 100;
+    } else if (threshold === 2) {
+      rate = (safeGet(homeTeam.goalStats.over25Rate) + safeGet(awayTeam.goalStats.over25Rate)) / 2 / 100;
+    } else if (threshold === 3) {
+      rate = (safeGet(homeTeam.goalStats.over35Rate) + safeGet(awayTeam.goalStats.over35Rate)) / 2 / 100;
+    }
+
+    return Math.min(rate, 1);
   }
 
-  private calculateFinalConfidence(scores: ConfidenceScore): number {
+  private calculateFinalConfidence(scores: DetailedConfidenceScore): number {
     return (
       scores.formScore * WEIGHTS.formScore +
       scores.homeAwayScore * WEIGHTS.homeAwayStrength +
@@ -317,11 +469,11 @@ export class PredictionEngine {
   }
 
   private classifyConfidence(confidence: number): ConfidenceLevel {
-    if (confidence >= 95) return 'ultra_safe';
-    if (confidence >= 90) return 'very_safe';
-    if (confidence >= 85) return 'safe';
-    if (confidence >= 80) return 'moderate';
-    return 'discard';
+    if (confidence >= CONFIDENCE_THRESHOLDS.ULTRA_SAFE) return 'ultra_safe';
+    if (confidence >= CONFIDENCE_THRESHOLDS.VERY_SAFE) return 'very_safe';
+    if (confidence >= CONFIDENCE_THRESHOLDS.SAFE) return 'safe';
+    if (confidence >= CONFIDENCE_THRESHOLDS.MODERATE) return 'moderate';
+    return 'hidden';
   }
 
   private getWinnerPredictionText(
@@ -341,10 +493,10 @@ export class PredictionEngine {
     confidence: number
   ): string {
     if (market === 'home_win') {
-      return `Home team form: ${homeTeam.lastFiveMatches.wins}/5, Home record strong`;
+      return `Home team form: ${homeTeam.lastFiveMatches.wins}/5, Home record: ${homeTeam.homeStats.wins}/10 (${((homeTeam.homeStats.wins / 10) * 100).toFixed(0)}%)`;
     } else if (market === 'away_win') {
-      return `Away team form: ${awayTeam.lastFiveMatches.wins}/5, Strong away record`;
+      return `Away team form: ${awayTeam.lastFiveMatches.wins}/5, Away record: ${awayTeam.awayStats.wins}/10 (${((awayTeam.awayStats.wins / 10) * 100).toFixed(0)}%)`;
     }
-    return `Both teams showing balanced form`;
+    return `Both teams showing balanced form, Draw probability strong`;
   }
 }
